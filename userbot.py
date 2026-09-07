@@ -1,9 +1,14 @@
 """
-Userbot Telegram - Promosi ke Grup
-Pakai Telethon (login akun asli, bukan bot token).
+IvasBot — Userbot Telegram buat promosi massal ke semua grup.
+Pakai Telethon, login pakai akun asli (bukan bot token).
 
-Jalankan: python userbot.py
-Perintah: .promote | .promosi | .addbl | .delbl | .listbl | .setdelay | .stop | .ping | .id | .help
+Jalankan : python userbot.py
+Perintah : .promosi | .promote | .addbl | .delbl | .listbl | .setdelay | .stop | .ping | .id | .help
+
+Catatan penting soal promosi:
+Kalau kita reply ke pesan orang lain (akun premium / postingan channel),
+pesan itu akan DI-FORWARD apa adanya — bukan diketik ulang oleh akun kita.
+Alasannya ada di komentar fungsi `kirim_promosi_ke()`.
 """
 
 import os
@@ -21,10 +26,14 @@ from telethon.errors import (
     ChannelPrivateError,
 )
 
-CONFIG_FILE = "config.json"
-SESSION_NAME = "userbot"
+BERKAS_KONFIG = "config.json"
+NAMA_SESI = "userbot"
 
-DEFAULT_CONFIG = {
+# Jeda sebelum pesan perintah dihapus sendiri (detik).
+# Sengaja pendek: cukup buat kita baca konfirmasinya, tapi gak nongkrong lama di grup.
+JEDA_HAPUS_OTOMATIS = 2
+
+KONFIG_DEFAULT = {
     "api_id": 0,
     "api_hash": "",
     "delay_min": 5,
@@ -33,653 +42,767 @@ DEFAULT_CONFIG = {
 }
 
 
-
 # ---------------------------------------------------------------------------
-# Config
+# Konfigurasi
 # ---------------------------------------------------------------------------
-def load_config():
-    cfg = dict(DEFAULT_CONFIG)
-    if os.path.exists(CONFIG_FILE):
+def muat_konfigurasi():
+    """Baca config.json. Kalau rusak/gak ada, pakai nilai default biar bot tetap hidup."""
+    konfig = dict(KONFIG_DEFAULT)
+    if os.path.exists(BERKAS_KONFIG):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg.update(json.load(f))
+            with open(BERKAS_KONFIG, "r", encoding="utf-8") as berkas:
+                konfig.update(json.load(berkas))
         except (json.JSONDecodeError, OSError):
-            print("[!] config.json rusak, memakai default.")
-    return cfg
+            print("[!] config.json rusak, sementara pakai konfigurasi default.")
+    return konfig
 
 
-def save_config(cfg):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+def simpan_konfigurasi(konfig):
+    """Tulis ulang config.json. ensure_ascii=False biar emoji/teks Indonesia gak jadi \\uXXXX."""
+    with open(BERKAS_KONFIG, "w", encoding="utf-8") as berkas:
+        json.dump(konfig, berkas, indent=2, ensure_ascii=False)
 
 
-config = load_config()
+konfig = muat_konfigurasi()
 
-# State runtime: banyak job promosi bisa jalan bersamaan.
-# jobs[id] = {"task": asyncio.Task, "stop": bool, "chat_id": int}
-JOBS = {}
-JOB_SEQ = {"n": 0}
+# Beberapa job promosi boleh jalan bareng, jadi disimpan per id.
+# DAFTAR_JOB[id] = {"task": asyncio.Task, "stop": bool, "chat_id": int}
+DAFTAR_JOB = {}
+NOMOR_JOB = {"terakhir": 0}
 
 
 # ---------------------------------------------------------------------------
-# Helper Tampilan & Durasi
+# Helper tampilan
 # ---------------------------------------------------------------------------
-def bq(text: str) -> str:
-    """Bungkus teks jadi blockquote HTML."""
-    return "<blockquote>" + text + "</blockquote>"
+GARIS = "━━━━━━━━━━━━━━━━━━━━"
 
 
-async def reply_bq(event, text: str):
-    """Balas pesan dalam format blockquote."""
-    await event.reply(bq(text), parse_mode="html")
+def kutip(teks: str) -> str:
+    """Bungkus teks jadi blockquote HTML supaya rapi & bisa dilipat Telegram."""
+    return "<blockquote>" + teks + "</blockquote>"
 
 
-def parse_duration(text: str) -> int:
+def susun_panel(judul: str, baris=None, catatan: str = "") -> str:
     """
-    Parse durasi teks ke detik.
-    Contoh: '1 jam', '2 hours', '10 menit', '30m', '45 detik', '60s', '1.5 jam'
-    Return total detik (int). Return 0 jika tidak valid.
+    Rangkai pesan jadi satu format panel yang seragam:
+
+        JUDUL
+        ━━━━━━━━━━━
+        isi baris
+        ━━━━━━━━━━━
+        catatan kecil
+
+    `baris` boleh list of str atau list of (label, nilai) biar kolomnya rata.
     """
-    if not text:
+    bagian = [f"<b>{judul}</b>", GARIS]
+
+    if baris:
+        # Kalau formatnya (label, nilai), labelnya di-pad biar titik dua-nya lurus.
+        pasangan = [b for b in baris if isinstance(b, (tuple, list))]
+        lebar_label = max((len(str(p[0])) for p in pasangan), default=0)
+
+        for item in baris:
+            if isinstance(item, (tuple, list)):
+                label, nilai = item[0], item[1]
+                bagian.append(f"{str(label).ljust(lebar_label)} : <b>{nilai}</b>")
+            else:
+                bagian.append(str(item))
+
+    if catatan:
+        bagian.append(GARIS)
+        bagian.append(f"<i>{catatan}</i>")
+
+    return "\n".join(bagian)
+
+
+async def balas_panel(event, judul, baris=None, catatan=""):
+    """Ganti isi pesan perintah kita sendiri dengan panel rapi."""
+    await event.edit(kutip(susun_panel(judul, baris, catatan)), parse_mode="html")
+
+
+async def kirim_panel(klien, chat_id, judul, baris=None, catatan=""):
+    """Kirim panel sebagai pesan baru (dipakai worker yang jalan di background)."""
+    await klien.send_message(
+        chat_id, kutip(susun_panel(judul, baris, catatan)), parse_mode="html"
+    )
+
+
+async def hapus_setelah(event, jeda: int = JEDA_HAPUS_OTOMATIS):
+    """
+    Hapus pesan perintah setelah jeda singkat.
+    Dipakai buat perintah blacklist: konfirmasinya cukup kita lihat sebentar,
+    jangan sampai anggota grup lain ikut baca kalau kita nge-blacklist grupnya.
+    """
+    await asyncio.sleep(jeda)
+    try:
+        await event.delete()
+    except Exception:
+        # Pesan bisa sudah dihapus manual atau kita kehilangan izin — bukan masalah fatal.
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Helper durasi
+# ---------------------------------------------------------------------------
+def baca_durasi(teks: str) -> int:
+    """
+    Ubah durasi versi manusia jadi detik.
+    Contoh: '1 jam', '2 hours', '10 menit', '30m', '45 detik', '60s', '1.5 jam'.
+    Angka telanjang dianggap menit (paling sering dipakai). 0 = format gak dikenali.
+    """
+    if not teks:
         return 0
-    text = text.lower().strip()
+    teks = teks.lower().strip()
 
-    # Cek format gabungan seperti '1 jam 30 menit' atau '10m'
-    total_seconds = 0
-    patterns = [
-        (r'(\d+(?:\.\d+)?)\s*(?:jam|hours?|hr|h|j)\b', 3600),
-        (r'(\d+(?:\.\d+)?)\s*(?:menit|mins?|minute|m)\b', 60),
-        (r'(\d+(?:\.\d+)?)\s*(?:detik|secs?|second|s)\b', 1),
+    total_detik = 0
+    pola_satuan = [
+        (r"(\d+(?:\.\d+)?)\s*(?:jam|hours?|hr|h|j)\b", 3600),
+        (r"(\d+(?:\.\d+)?)\s*(?:menit|mins?|minute|m)\b", 60),
+        (r"(\d+(?:\.\d+)?)\s*(?:detik|secs?|second|s)\b", 1),
     ]
 
-    matched = False
-    for pat, multiplier in patterns:
-        m = re.search(pat, text)
-        if m:
-            matched = True
-            total_seconds += float(m.group(1)) * multiplier
+    ketemu = False
+    for pola, pengali in pola_satuan:
+        cocok = re.search(pola, teks)
+        if cocok:
+            ketemu = True
+            total_detik += float(cocok.group(1)) * pengali
 
-    if not matched:
-        # Cek jika cuma angka (asumsikan menit)
+    if not ketemu:
         try:
-            val = float(text)
-            return int(val * 60)
+            return int(float(teks) * 60)
         except ValueError:
             return 0
 
-    return int(total_seconds)
+    return int(total_detik)
 
 
-def format_duration(seconds: int) -> str:
-    """Format detik ke teks yang mudah dibaca."""
-    if seconds >= 3600:
-        jam = seconds // 3600
-        sisa = seconds % 3600
-        menit = sisa // 60
-        if menit > 0:
-            return f"{jam} jam {menit} menit"
-        return f"{jam} jam"
-    elif seconds >= 60:
-        menit = seconds // 60
-        sisa = seconds % 60
-        if sisa > 0:
-            return f"{menit} menit {sisa} detik"
-        return f"{menit} menit"
-    return f"{seconds} detik"
+def format_durasi(detik: int) -> str:
+    """Kebalikan dari baca_durasi(): detik -> teks yang enak dibaca."""
+    if detik >= 3600:
+        jam = detik // 3600
+        menit = (detik % 3600) // 60
+        return f"{jam} jam {menit} menit" if menit else f"{jam} jam"
+    if detik >= 60:
+        menit = detik // 60
+        sisa = detik % 60
+        return f"{menit} menit {sisa} detik" if sisa else f"{menit} menit"
+    return f"{detik} detik"
 
 
-def parse_promote_args(arg_text: str):
+def baca_argumen_promosi(teks_argumen: str):
     """
-    Parse argument promote:
-    Bisa berupa:
-    - '5 1 jam' -> ('', 5, 3600)
+    Pecah argumen `.promosi` jadi (teks, jumlah_putaran, interval_detik).
+
+    - '5 1 jam'                    -> ('', 5, 3600)
     - 'Jual Akun Murah 3 30 menit' -> ('Jual Akun Murah', 3, 1800)
-    - 'Jual Akun Murah' -> ('Jual Akun Murah', None, None)
-    - '' -> ('', None, None)
+    - 'Jual Akun Murah'            -> ('Jual Akun Murah', None, None)
+    - ''                           -> ('', None, None)
+
+    Kalau jumlah/interval gak lengkap, semuanya dianggap teks promosi —
+    biar user gak kehilangan pesannya cuma karena salah format angka.
     """
-    if not arg_text:
+    if not teks_argumen:
         return "", None, None
 
-    arg_text = arg_text.strip()
+    teks_argumen = teks_argumen.strip()
+    pola = (
+        r"^(?:([\s\S]+?)\s+)?(\d+)\s+"
+        r"(\d+(?:\.\d+)?\s*(?:jam|hours?|hr|h|j|menit|mins?|minute|m|detik|secs?|second|s)"
+        r"(?:[\s\S]*)?)$"
+    )
+    cocok = re.match(pola, teks_argumen, re.IGNORECASE)
+    if cocok:
+        bagian_teks = (cocok.group(1) or "").strip()
+        jumlah_putaran = int(cocok.group(2))
+        interval_detik = baca_durasi(cocok.group(3).strip())
+        if jumlah_putaran > 0 and interval_detik > 0:
+            return bagian_teks, jumlah_putaran, interval_detik
 
-    # Match format [teks opsional] <repeat_count> <interval>
-    # Contoh: "5 1 jam", "3 10m", "jual akun 10 30 menit"
-    pattern = r'^(?:([\s\S]+?)\s+)?(\d+)\s+(\d+(?:\.\d+)?\s*(?:jam|hours?|hr|h|j|menit|mins?|minute|m|detik|secs?|second|s)(?:[\s\S]*)?)$'
-    m = re.match(pattern, arg_text, re.IGNORECASE)
-    if m:
-        text_part = (m.group(1) or "").strip()
-        repeat_count = int(m.group(2))
-        dur_str = m.group(3).strip()
-        interval_secs = parse_duration(dur_str)
-        if repeat_count > 0 and interval_secs > 0:
-            return text_part, repeat_count, interval_secs
-
-    return arg_text, None, None
+    return teks_argumen, None, None
 
 
-async def wait_user_input(client, chat_id, timeout=60):
+async def tunggu_jawaban(klien, chat_id, batas_detik=60):
     """
-    Menunggu respon berikutnya yang diketik oleh kita sendiri di chat ini.
-    Mengembalikan (text, event) atau (None, None) jika timeout.
+    Tunggu satu pesan berikutnya yang kita ketik sendiri di chat ini (buat menu interaktif).
+    Jawabannya langsung dihapus supaya chat gak penuh angka '1', '2', '30 menit'.
+    Return teks jawaban, atau None kalau kehabisan waktu.
     """
     loop = asyncio.get_running_loop()
-    fut = loop.create_future()
+    janji = loop.create_future()
 
-    async def _handler(e):
-        # Pastikan dari chat yang sama dan pesan baru
-        if e.chat_id == chat_id and not fut.done():
-            fut.set_result(e)
+    async def _penangkap(e):
+        if e.chat_id == chat_id and not janji.done():
+            janji.set_result(e)
 
-    client.add_event_handler(_handler, events.NewMessage(chats=chat_id, outgoing=True))
+    klien.add_event_handler(
+        _penangkap, events.NewMessage(chats=chat_id, outgoing=True)
+    )
 
     try:
-        resp_event = await asyncio.wait_for(fut, timeout=timeout)
-        text = resp_event.text.strip()
-        # Otomatis hapus pesan input kita agar tampilan chat tetap bersih
+        event_jawaban = await asyncio.wait_for(janji, timeout=batas_detik)
+        jawaban = (event_jawaban.text or "").strip()
         try:
-            await resp_event.delete()
+            await event_jawaban.delete()
         except Exception:
             pass
-        return text, resp_event
+        return jawaban
     except asyncio.TimeoutError:
-        return None, None
+        return None
     finally:
-        client.remove_event_handler(_handler)
+        klien.remove_event_handler(_penangkap)
 
 
 # ---------------------------------------------------------------------------
 # Login
 # ---------------------------------------------------------------------------
-def ensure_api_credentials():
-    """Minta api_id / api_hash kalau belum ada, lalu simpan."""
-    if not config.get("api_id") or not config.get("api_hash"):
+def pastikan_kredensial_api():
+    """Minta api_id / api_hash sekali di awal, lalu simpan ke config.json."""
+    if not konfig.get("api_id") or not konfig.get("api_hash"):
         print("== Setup API (sekali saja) ==")
         print("Ambil di https://my.telegram.org > API development tools\n")
         while True:
             try:
-                config["api_id"] = int(input("Masukkan api_id  : ").strip())
+                konfig["api_id"] = int(input("Masukkan api_id  : ").strip())
                 break
             except ValueError:
                 print("api_id harus angka.")
-        config["api_hash"] = input("Masukkan api_hash: ").strip()
-        save_config(config)
+        konfig["api_hash"] = input("Masukkan api_hash: ").strip()
+        simpan_konfigurasi(konfig)
 
 
 # ---------------------------------------------------------------------------
-# Blacklist helpers
+# Daftar hitam (blacklist)
 # ---------------------------------------------------------------------------
-async def resolve_target_id(client, ref):
-    """Ubah @username / id / -100id jadi id numerik. None kalau gagal."""
-    ref = str(ref).strip()
+async def cari_id_target(klien, acuan):
+    """Ubah @username / id / -100id jadi id numerik. None kalau gagal diresolve."""
+    acuan = str(acuan).strip()
     try:
-        if ref.lstrip("-").isdigit():
-            ent = await client.get_entity(int(ref))
+        if acuan.lstrip("-").isdigit():
+            entitas = await klien.get_entity(int(acuan))
         else:
-            ent = await client.get_entity(ref)
-        return ent.id
+            entitas = await klien.get_entity(acuan)
+        return entitas.id
     except Exception:
         return None
 
 
-def in_blacklist(chat_id) -> bool:
-    return int(chat_id) in [int(x) for x in config.get("blacklist", [])]
+def sedang_diblacklist(chat_id) -> bool:
+    return int(chat_id) in [int(x) for x in konfig.get("blacklist", [])]
 
 
 # ---------------------------------------------------------------------------
-# Bangun konten promosi
+# Pengiriman promosi
 # ---------------------------------------------------------------------------
-async def send_promo_to(client, target, source_msg, plain_text):
+async def kirim_promosi_ke(klien, tujuan, pesan_sumber, teks_biasa):
     """
-    Kirim promosi ke satu target.
-    - Kalau source_msg (pesan yang di-reply) ada -> teruskan apa adanya
-      (teks + entities termasuk emoji premium/custom + media).
-    - Kalau tidak, kirim plain_text biasa.
+    Kirim satu promosi ke satu grup.
+
+    Kalau kita reply ke sebuah pesan, pesan itu DI-FORWARD, bukan disalin.
+    Ini penting: emoji premium dan format dari akun premium/channel cuma tetap utuh
+    kalau di-forward — begitu disalin, akun kita yang jadi "pengirim" dan emoji
+    premium-nya rontok karena akun kita belum tentu premium. Forward juga bikin
+    label "Diteruskan dari ..." nempel, jadi kredit tetap ke sumber aslinya.
+
+    Kalau grup tujuan mematikan forward (protected content), baru kita salin manual
+    sebagai jalan terakhir daripada promosinya gagal total.
     """
-    if source_msg is not None:
-        # Pertahankan teks, formatting, custom/premium emoji, dan media.
-        await client.send_message(
-            target,
-            message=source_msg.message or "",
-            formatting_entities=source_msg.entities or None,
-            file=source_msg.media if source_msg.media else None,
-        )
-    else:
-        await client.send_message(target, plain_text)
-
-
-# ---------------------------------------------------------------------------
-# Client + handler registration
-# ---------------------------------------------------------------------------
-ensure_api_credentials()
-client = TelegramClient(SESSION_NAME, config["api_id"], config["api_hash"])
-
-
-def register_handlers():
-    # Cuma perintah dari akun sendiri (outgoing)
-    def cmd(pattern):
-        return events.NewMessage(outgoing=True, pattern=pattern)
-
-    # .ping ---------------------------------------------------------------
-    @client.on(cmd(r"^\.ping$"))
-    async def _ping(event):
-        await event.edit(bq("🏓 Pong! Userbot aktif."), parse_mode="html")
-
-    # .id -----------------------------------------------------------------
-    @client.on(cmd(r"^\.id$"))
-    async def _id(event):
-        chat = await event.get_chat()
-        me = await event.get_sender()
-        text = (
-            f"🆔 Info\n"
-            f"Chat ID : {event.chat_id}\n"
-            f"User ID : {getattr(me, 'id', '-')}"
-        )
-        await event.edit(bq(text), parse_mode="html")
-
-    # .help ---------------------------------------------------------------
-    @client.on(cmd(r"^\.help$"))
-    async def _help(event):
-        text = (
-            "📖 <b>Daftar Perintah Userbot</b>\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "• <code>.promote &lt;teks&gt;</code> atau reply pesan\n"
-            "  <i>Buka menu: [1] Kirim 1x, [2] Manual, [0] Batal</i>\n"
-            "• <code>.promote &lt;teks&gt; &lt;kali&gt; &lt;interval&gt;</code>\n"
-            "  <i>Contoh: .promote 5 1 jam (sambil reply)</i>\n"
-            "  <i>Contoh: .promote Promo Hebat 3 30 menit</i>\n"
-            "• <code>.addbl [@user/id]</code> — Blacklist grup\n"
-            "• <code>.delbl [@user/id]</code> — Hapus dari blacklist\n"
-            "• <code>.listbl</code> — Lihat daftar blacklist\n"
-            "• <code>.setdelay &lt;min&gt; &lt;max&gt;</code> — Atur jeda per grup\n"
-            "• <code>.stop</code> — Hentikan semua promosi\n"
-            "• <code>.ping</code> / <code>.id</code> — Cek status & ID"
-        )
-        await event.edit(bq(text), parse_mode="html")
-
-    # .setdelay -----------------------------------------------------------
-    @client.on(cmd(r"^\.setdelay(?:\s+(\d+)\s+(\d+))?$"))
-    async def _setdelay(event):
-        m = event.pattern_match
-        if not m.group(1):
-            await event.edit(
-                bq(f"⏱ Delay sekarang: {config['delay_min']}–{config['delay_max']} detik.\n"
-                   "Ubah: .setdelay <min> <max>"),
-                parse_mode="html",
+    if pesan_sumber is not None:
+        try:
+            await klien.forward_messages(tujuan, pesan_sumber)
+            return
+        except FloodWaitError:
+            # Biar diurus pemanggil yang punya logika tunggu + retry.
+            raise
+        except Exception:
+            await klien.send_message(
+                tujuan,
+                message=pesan_sumber.message or "",
+                formatting_entities=pesan_sumber.entities or None,
+                file=pesan_sumber.media if pesan_sumber.media else None,
             )
             return
-        lo, hi = int(m.group(1)), int(m.group(2))
-        if lo > hi:
-            lo, hi = hi, lo
-        config["delay_min"], config["delay_max"] = lo, hi
-        save_config(config)
-        await event.edit(bq(f"✅ Delay diset {lo}–{hi} detik."), parse_mode="html")
+
+    await klien.send_message(tujuan, teks_biasa)
+
+
+# ---------------------------------------------------------------------------
+# Klien + pendaftaran perintah
+# ---------------------------------------------------------------------------
+pastikan_kredensial_api()
+klien = TelegramClient(NAMA_SESI, konfig["api_id"], konfig["api_hash"])
+
+
+def daftarkan_perintah():
+    """Semua handler perintah dikumpulkan di sini biar gampang dilacak."""
+
+    def perintah(pola):
+        # outgoing=True: hanya bereaksi ke perintah yang kita ketik sendiri.
+        return events.NewMessage(outgoing=True, pattern=pola)
+
+    # .ping ---------------------------------------------------------------
+    @klien.on(perintah(r"^\.ping$"))
+    async def _ping(event):
+        await balas_panel(event, "🏓 PONG", ["Userbot aktif dan siap dipakai."])
+
+    # .id -----------------------------------------------------------------
+    @klien.on(perintah(r"^\.id$"))
+    async def _info_id(event):
+        pengirim = await event.get_sender()
+        await balas_panel(
+            event,
+            "🆔 INFORMASI ID",
+            [
+                ("Chat ID", event.chat_id),
+                ("User ID", getattr(pengirim, "id", "-")),
+            ],
+        )
+
+    # .help ---------------------------------------------------------------
+    @klien.on(perintah(r"^\.help$"))
+    async def _bantuan(event):
+        isi = [
+            "🚀 <b>PROMOSI</b>",
+            "<code>.promosi</code> — buka menu (reply pesan dulu)",
+            "<code>.promosi &lt;kali&gt; &lt;interval&gt;</code>",
+            "<i>contoh: .promosi 5 1 jam (sambil reply)</i>",
+            "<code>.promosi &lt;teks&gt; &lt;kali&gt; &lt;interval&gt;</code>",
+            "<i>contoh: .promosi Promo Hebat 3 30 menit</i>",
+            "<code>.stop</code> — hentikan semua promosi",
+            "",
+            "🚫 <b>DAFTAR HITAM</b>",
+            "<code>.addbl [@user/id]</code> — kecualikan grup",
+            "<code>.delbl [@user/id]</code> — batalkan pengecualian",
+            "<code>.listbl</code> — lihat daftarnya",
+            "",
+            "⚙️ <b>LAIN-LAIN</b>",
+            "<code>.setdelay &lt;min&gt; &lt;max&gt;</code> — jeda antar grup",
+            "<code>.ping</code> / <code>.id</code> — cek status & ID",
+        ]
+        await balas_panel(
+            event,
+            "📖 DAFTAR PERINTAH IVASBOT",
+            isi,
+            catatan="Pesan yang di-reply akan diteruskan apa adanya, "
+                    "termasuk emoji premium dari pengirim aslinya.",
+        )
+
+    # .setdelay -----------------------------------------------------------
+    @klien.on(perintah(r"^\.setdelay(?:\s+(\d+)\s+(\d+))?$"))
+    async def _atur_jeda(event):
+        cocok = event.pattern_match
+        if not cocok.group(1):
+            await balas_panel(
+                event,
+                "⏱ JEDA ANTAR GRUP",
+                [("Sekarang", f"{konfig['delay_min']}–{konfig['delay_max']} detik")],
+                catatan="Ubah dengan: .setdelay &lt;min&gt; &lt;max&gt;",
+            )
+            return
+
+        minimal, maksimal = int(cocok.group(1)), int(cocok.group(2))
+        if minimal > maksimal:
+            # Kebalik itu manusiawi, tinggal ditukar aja daripada dimarahin error.
+            minimal, maksimal = maksimal, minimal
+
+        konfig["delay_min"], konfig["delay_max"] = minimal, maksimal
+        simpan_konfigurasi(konfig)
+        await balas_panel(
+            event,
+            "✅ JEDA DIPERBARUI",
+            [("Jeda baru", f"{minimal}–{maksimal} detik")],
+            catatan="Jeda dipilih acak dalam rentang ini setiap kirim ke grup.",
+        )
 
     # .stop ---------------------------------------------------------------
-    @client.on(cmd(r"^\.stop$"))
-    async def _stop(event):
-        active = [j for j in JOBS.values() if not j["stop"]]
-        if not active:
-            await event.edit(bq("Tidak ada promosi yang berjalan."), parse_mode="html")
+    @klien.on(perintah(r"^\.stop$"))
+    async def _hentikan(event):
+        job_aktif = [j for j in DAFTAR_JOB.values() if not j["stop"]]
+        if not job_aktif:
+            await balas_panel(event, "ℹ️ TIDAK ADA PROMOSI", ["Semua job sudah berhenti."])
             return
-        for j in JOBS.values():
-            j["stop"] = True
-        await event.edit(
-            bq(f"🛑 Menghentikan {len(active)} promosi yang berjalan..."),
-            parse_mode="html",
+
+        for job in DAFTAR_JOB.values():
+            job["stop"] = True
+
+        await balas_panel(
+            event,
+            "🛑 PROMOSI DIHENTIKAN",
+            [("Job dihentikan", f"{len(job_aktif)} job")],
+            catatan="Pengiriman berhenti setelah grup yang sedang diproses selesai.",
         )
 
     # .addbl --------------------------------------------------------------
-    @client.on(cmd(r"^\.addbl(?:\s+(.+))?$"))
-    async def _addbl(event):
-        arg = event.pattern_match.group(1)
-        if arg:
-            tid = await resolve_target_id(client, arg.strip())
-            if tid is None:
-                await event.edit(bq("❌ Grup/target tidak ditemukan."), parse_mode="html")
+    @klien.on(perintah(r"^\.addbl(?:\s+(.+))?$"))
+    async def _tambah_blacklist(event):
+        argumen = event.pattern_match.group(1)
+        if argumen:
+            id_target = await cari_id_target(klien, argumen.strip())
+            if id_target is None:
+                await balas_panel(event, "❌ TARGET TIDAK DITEMUKAN", ["Cek lagi @username atau ID-nya."])
+                await hapus_setelah(event)
                 return
         else:
-            tid = event.chat_id  # grup tempat perintah diketik
-        bl = config.setdefault("blacklist", [])
-        if int(tid) in [int(x) for x in bl]:
-            await event.edit(bq("ℹ️ Grup itu sudah di blacklist."), parse_mode="html")
-            return
-        bl.append(int(tid))
-        save_config(config)
-        await event.edit(bq(f"✅ Ditambahkan ke blacklist: {tid}"), parse_mode="html")
+            id_target = event.chat_id  # tanpa argumen = grup tempat perintah diketik
+
+        daftar = konfig.setdefault("blacklist", [])
+        if int(id_target) in [int(x) for x in daftar]:
+            await balas_panel(event, "ℹ️ SUDAH DI DAFTAR HITAM", [("ID", id_target)])
+        else:
+            daftar.append(int(id_target))
+            simpan_konfigurasi(konfig)
+            await balas_panel(
+                event,
+                "✅ MASUK DAFTAR HITAM",
+                [("ID", id_target), ("Total", f"{len(daftar)} grup")],
+                catatan="Grup ini dilewati saat promosi.",
+            )
+
+        # Hapus jejaknya — jangan sampai anggota grup tahu grupnya kita kecualikan.
+        await hapus_setelah(event)
 
     # .delbl --------------------------------------------------------------
-    @client.on(cmd(r"^\.delbl(?:\s+(.+))?$"))
-    async def _delbl(event):
-        arg = event.pattern_match.group(1)
-        if arg:
-            tid = await resolve_target_id(client, arg.strip())
-            if tid is None:
-                await event.edit(bq("❌ Grup/target tidak ditemukan."), parse_mode="html")
+    @klien.on(perintah(r"^\.delbl(?:\s+(.+))?$"))
+    async def _hapus_blacklist(event):
+        argumen = event.pattern_match.group(1)
+        if argumen:
+            id_target = await cari_id_target(klien, argumen.strip())
+            if id_target is None:
+                await balas_panel(event, "❌ TARGET TIDAK DITEMUKAN", ["Cek lagi @username atau ID-nya."])
+                await hapus_setelah(event)
                 return
         else:
-            tid = event.chat_id
-        bl = config.setdefault("blacklist", [])
-        bl_int = [int(x) for x in bl]
-        if int(tid) not in bl_int:
-            await event.edit(bq("ℹ️ Grup itu tidak ada di blacklist."), parse_mode="html")
-            return
-        config["blacklist"] = [x for x in bl if int(x) != int(tid)]
-        save_config(config)
-        await event.edit(bq(f"✅ Dihapus dari blacklist: {tid}"), parse_mode="html")
+            id_target = event.chat_id
+
+        daftar = konfig.setdefault("blacklist", [])
+        if int(id_target) not in [int(x) for x in daftar]:
+            await balas_panel(event, "ℹ️ TIDAK ADA DI DAFTAR HITAM", [("ID", id_target)])
+        else:
+            konfig["blacklist"] = [x for x in daftar if int(x) != int(id_target)]
+            simpan_konfigurasi(konfig)
+            await balas_panel(
+                event,
+                "✅ KELUAR DARI DAFTAR HITAM",
+                [("ID", id_target), ("Sisa", f"{len(konfig['blacklist'])} grup")],
+                catatan="Grup ini ikut dipromosikan lagi.",
+            )
+
+        await hapus_setelah(event)
 
     # .listbl -------------------------------------------------------------
-    @client.on(cmd(r"^\.listbl$"))
-    async def _listbl(event):
-        bl = config.get("blacklist", [])
-        if not bl:
-            await event.edit(bq("📭 Blacklist kosong."), parse_mode="html")
-            return
-        lines = ["🚫 Daftar Blacklist:"]
-        for i, x in enumerate(bl, 1):
-            lines.append(f"{i}. {x}")
-        await event.edit(bq("\n".join(lines)), parse_mode="html")
-
-    # .promote / .promosi -------------------------------------------------
-    @client.on(cmd(r"^\.(?:promote|promosi)(?:\s+([\s\S]+))?$"))
-    async def _promote(event):
-        reply_msg = await event.get_reply_message()
-        raw_arg = event.pattern_match.group(1)
-
-        # Cek apakah tidak ada reply dan tidak ada argumen
-        if reply_msg is None and not raw_arg:
-            panduan = (
-                "📖 <b>Cara Pakai Promosi:</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "• <b>Menu Interaktif:</b>\n"
-                "  Reply pesan lalu ketik <code>.promote</code>\n"
-                "  <i>(Akan muncul pilihan Kirim 1x / Manual / Batal)</i>\n\n"
-                "• <b>Format Cepat:</b>\n"
-                "  <code>.promote &lt;teks&gt; &lt;jumlah_kali&gt; &lt;interval&gt;</code>\n"
-                "  <i>Contoh: .promote 5 1 jam</i> (sambil reply)\n"
-                "  <i>Contoh: .promote Jual Diamond 3 30 menit</i>"
-            )
-            await event.edit(bq(panduan), parse_mode="html")
+    @klien.on(perintah(r"^\.listbl$"))
+    async def _lihat_blacklist(event):
+        daftar = konfig.get("blacklist", [])
+        if not daftar:
+            await balas_panel(event, "📭 DAFTAR HITAM KOSONG", ["Semua grup ikut dipromosikan."])
             return
 
-        # Parsing argumen jika ada
-        text_parsed, repeat_parsed, interval_parsed = parse_promote_args(raw_arg)
-        plain_text = text_parsed.strip() if text_parsed else ""
-
-        chat_id = event.chat_id
-
-        # KASUS 1: Parameter repeat & interval sudah lengkap diberikan di command
-        if repeat_parsed is not None and interval_parsed is not None:
-            JOB_SEQ["n"] += 1
-            job_id = JOB_SEQ["n"]
-            info = (
-                f"🚀 <b>Promosi #{job_id} Dimulai!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🔁 Jumlah Kirim : <b>{repeat_parsed}x</b>\n"
-                f"⏱ Interval      : <b>{format_duration(interval_parsed)}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"<i>Berjalan di background. Ketik <code>.stop</code> untuk batal.</i>"
-            )
-            await event.edit(bq(info), parse_mode="html")
-            task = asyncio.create_task(
-                _run_promo(job_id, chat_id, reply_msg, plain_text, repeat_parsed, interval_parsed)
-            )
-            JOBS[job_id] = {"task": task, "stop": False, "chat_id": chat_id}
-            return
-
-        # KASUS 2: Buka Menu Interaktif ([1] Kirim 1x, [2] Manual, [0] Batal)
-        menu_text = (
-            "🚀 <b>PILIHAN PROMOSI</b>\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "<b>[ 1 ]</b> Kirim 1 Kali\n"
-            "<b>[ 2 ]</b> Manual <i>(Set Jumlah & Interval)</i>\n"
-            "<b>[ 0 ]</b> Batal ❌\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "<i>Balas / ketik: <b>1</b>, <b>2</b>, atau <b>0</b></i>"
+        baris = [f"{no}. <code>{id_grup}</code>" for no, id_grup in enumerate(daftar, 1)]
+        await balas_panel(
+            event,
+            f"🚫 DAFTAR HITAM ({len(daftar)} GRUP)",
+            baris,
+            catatan="Hapus dengan: .delbl &lt;id&gt;",
         )
-        await event.edit(bq(menu_text), parse_mode="html")
 
-        # Tunggu respon pilihan menu
-        ans, ans_event = await wait_user_input(client, chat_id, timeout=60)
-        if not ans:
-            await event.edit(bq("⌛ Waktu habis. Promosi dibatalkan."), parse_mode="html")
+    # .promosi / .promote -------------------------------------------------
+    @klien.on(perintah(r"^\.(?:promosi|promote)(?:\s+([\s\S]+))?$"))
+    async def _promosi(event):
+        pesan_sumber = await event.get_reply_message()
+        argumen_mentah = event.pattern_match.group(1)
+
+        if pesan_sumber is None and not argumen_mentah:
+            await balas_panel(
+                event,
+                "📖 CARA PAKAI PROMOSI",
+                [
+                    "<b>Menu interaktif</b>",
+                    "Reply pesan promosi lalu ketik <code>.promosi</code>",
+                    "",
+                    "<b>Format cepat</b>",
+                    "<code>.promosi &lt;kali&gt; &lt;interval&gt;</code> (sambil reply)",
+                    "<i>contoh: .promosi 5 1 jam</i>",
+                    "<code>.promosi &lt;teks&gt; &lt;kali&gt; &lt;interval&gt;</code>",
+                    "<i>contoh: .promosi Jual Diamond 3 30 menit</i>",
+                ],
+                catatan="Reply lebih disarankan: pesannya diteruskan utuh "
+                        "beserta emoji premium & media dari sumber aslinya.",
+            )
             return
 
-        # PILIHAN 0: Batal
-        if ans in ("0", "batal", "cancel", "b"):
-            await event.edit(bq("❌ <b>Promosi Dibatalkan.</b>"), parse_mode="html")
+        teks_diurai, putaran_diurai, interval_diurai = baca_argumen_promosi(argumen_mentah)
+        teks_biasa = (teks_diurai or "").strip()
+        chat_id = event.chat_id
+        sumber = "Diteruskan dari pesan yang di-reply" if pesan_sumber else "Teks sendiri"
+
+        # Kasus 1: jumlah putaran & interval sudah ditulis langsung di perintah.
+        if putaran_diurai is not None and interval_diurai is not None:
+            await mulai_job(
+                event,
+                chat_id,
+                pesan_sumber,
+                teks_biasa,
+                putaran_diurai,
+                interval_diurai,
+                sumber,
+            )
             return
 
-        # PILIHAN 1: Kirim 1 Kali
-        if ans == "1":
-            JOB_SEQ["n"] += 1
-            job_id = JOB_SEQ["n"]
-            await event.edit(
-                bq(f"🚀 <b>Promosi #{job_id} (1x) Dimulai!</b>\n"
-                   f"<i>Berjalan di background. Ketik <code>.stop</code> untuk batal.</i>"),
-                parse_mode="html",
-            )
-            task = asyncio.create_task(
-                _run_promo(job_id, chat_id, reply_msg, plain_text, repeat_count=1, interval_secs=0)
-            )
-            JOBS[job_id] = {"task": task, "stop": False, "chat_id": chat_id}
+        # Kasus 2: buka menu interaktif.
+        await balas_panel(
+            event,
+            "🚀 MENU PROMOSI",
+            [
+                "<b>[ 1 ]</b>  Kirim sekali sekarang",
+                "<b>[ 2 ]</b>  Atur jumlah &amp; interval",
+                "<b>[ 0 ]</b>  Batal",
+                "",
+                f"📨 Sumber : <b>{sumber}</b>",
+            ],
+            catatan="Ketik angka pilihanmu (otomatis terhapus).",
+        )
+
+        jawaban = await tunggu_jawaban(klien, chat_id, batas_detik=60)
+        if not jawaban:
+            await balas_panel(event, "⌛ WAKTU HABIS", ["Promosi dibatalkan otomatis."])
             return
 
-        # PILIHAN 2: Manual
-        if ans == "2":
-            # Langkah 1: Minta jumlah kali kirim
-            prompt_kali = (
-                "📝 <b>Langkah 1/2 — Frekuensi Kirim</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "Mau berapa kali pesan dikirim ke semua grup?\n"
-                "<i>(Contoh ketik: <b>2</b>, <b>5</b>, atau <b>10</b>)</i>\n\n"
-                "<i>Ketik angka, atau <b>0</b> untuk batal</i>"
-            )
-            await event.edit(bq(prompt_kali), parse_mode="html")
+        if jawaban in ("0", "batal", "cancel", "b"):
+            await balas_panel(event, "❌ DIBATALKAN", ["Tidak ada pesan yang dikirim."])
+            return
 
-            ans_kali, _ = await wait_user_input(client, chat_id, timeout=60)
-            if not ans_kali or ans_kali in ("0", "batal"):
-                await event.edit(bq("❌ <b>Promosi Dibatalkan.</b>"), parse_mode="html")
+        if jawaban == "1":
+            await mulai_job(event, chat_id, pesan_sumber, teks_biasa, 1, 0, sumber)
+            return
+
+        if jawaban == "2":
+            # Langkah 1 — jumlah putaran.
+            await balas_panel(
+                event,
+                "📝 LANGKAH 1/2 — JUMLAH KIRIM",
+                ["Mau berapa kali pesan dikirim ke semua grup?", "<i>contoh: 2, 5, atau 10</i>"],
+                catatan="Ketik angka, atau 0 untuk batal.",
+            )
+            jawaban_jumlah = await tunggu_jawaban(klien, chat_id, batas_detik=60)
+            if not jawaban_jumlah or jawaban_jumlah in ("0", "batal"):
+                await balas_panel(event, "❌ DIBATALKAN", ["Tidak ada pesan yang dikirim."])
                 return
 
             try:
-                repeat_count = int(ans_kali)
-                if repeat_count <= 0:
+                jumlah_putaran = int(jawaban_jumlah)
+                if jumlah_putaran <= 0:
                     raise ValueError
             except ValueError:
-                await event.edit(bq("❌ Jumlah kirim harus berupa angka bulat positif."), parse_mode="html")
+                await balas_panel(event, "❌ FORMAT SALAH", ["Jumlah kirim harus angka bulat positif."])
                 return
 
-            # Langkah 2: Minta interval waktu
-            prompt_waktu = (
-                f"⏱ <b>Langkah 2/2 — Interval Waktu ({repeat_count}x kirim)</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "Kirim setiap berapa jam atau menit?\n"
-                "<i>(Contoh: <b>1 jam</b>, <b>30 menit</b>, atau <b>10m</b>)</i>\n\n"
-                "<i>Ketik durasi waktu, atau <b>0</b> untuk batal</i>"
+            # Langkah 2 — interval antar putaran.
+            await balas_panel(
+                event,
+                f"⏱ LANGKAH 2/2 — INTERVAL ({jumlah_putaran}x KIRIM)",
+                ["Kirim ulang setiap berapa lama?", "<i>contoh: 1 jam, 30 menit, atau 10m</i>"],
+                catatan="Ketik durasinya, atau 0 untuk batal.",
             )
-            await event.edit(bq(prompt_waktu), parse_mode="html")
-
-            ans_waktu, _ = await wait_user_input(client, chat_id, timeout=60)
-            if not ans_waktu or ans_waktu in ("0", "batal"):
-                await event.edit(bq("❌ <b>Promosi Dibatalkan.</b>"), parse_mode="html")
+            jawaban_waktu = await tunggu_jawaban(klien, chat_id, batas_detik=60)
+            if not jawaban_waktu or jawaban_waktu in ("0", "batal"):
+                await balas_panel(event, "❌ DIBATALKAN", ["Tidak ada pesan yang dikirim."])
                 return
 
-            interval_secs = parse_duration(ans_waktu)
-            if interval_secs <= 0:
-                await event.edit(
-                    bq("❌ Format waktu tidak valid. Gunakan misal: <code>1 jam</code> atau <code>15 menit</code>."),
-                    parse_mode="html",
+            interval_detik = baca_durasi(jawaban_waktu)
+            if interval_detik <= 0:
+                await balas_panel(
+                    event,
+                    "❌ FORMAT WAKTU SALAH",
+                    ["Gunakan format seperti <code>1 jam</code> atau <code>15 menit</code>."],
                 )
                 return
 
-            # Mulai job background
-            JOB_SEQ["n"] += 1
-            job_id = JOB_SEQ["n"]
-            info = (
-                f"✅ <b>Promosi Terjadwal #{job_id}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🔁 Jumlah Kirim : <b>{repeat_count}x</b>\n"
-                f"⏱ Interval      : <b>{format_duration(interval_secs)}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"<i>Memulai putaran ke-1 di background...</i>\n"
-                f"<i>Ketik <code>.stop</code> untuk menghentikan.</i>"
+            await mulai_job(
+                event, chat_id, pesan_sumber, teks_biasa, jumlah_putaran, interval_detik, sumber
             )
-            await event.edit(bq(info), parse_mode="html")
-
-            task = asyncio.create_task(
-                _run_promo(job_id, chat_id, reply_msg, plain_text, repeat_count, interval_secs)
-            )
-            JOBS[job_id] = {"task": task, "stop": False, "chat_id": chat_id}
             return
 
-        # Pilihan tidak dikenal
-        await event.edit(bq("❌ Pilihan tidak valid. Silakan ulangi <code>.promote</code>."), parse_mode="html")
+        await balas_panel(event, "❌ PILIHAN TIDAK VALID", ["Ulangi dengan <code>.promosi</code>."])
 
 
-async def _run_promo(job_id, chat_id, reply_msg, plain_text, repeat_count=1, interval_secs=0):
+async def mulai_job(event, chat_id, pesan_sumber, teks_biasa, jumlah_putaran, interval_detik, sumber):
+    """Daftarkan job promosi baru, tampilkan ringkasannya, lalu lepas ke background."""
+    NOMOR_JOB["terakhir"] += 1
+    id_job = NOMOR_JOB["terakhir"]
+
+    ringkasan = [
+        ("Job", f"#{id_job}"),
+        ("Jumlah kirim", f"{jumlah_putaran}x"),
+        ("Interval", format_durasi(interval_detik) if interval_detik else "sekali jalan"),
+        ("Jeda/grup", f"{konfig['delay_min']}–{konfig['delay_max']} detik"),
+        ("Sumber", sumber),
+    ]
+    await balas_panel(
+        event,
+        "🚀 PROMOSI DIMULAI",
+        ringkasan,
+        catatan="Jalan di background. Ketik .stop untuk menghentikan.",
+    )
+
+    tugas = asyncio.create_task(
+        jalankan_promosi(id_job, chat_id, pesan_sumber, teks_biasa, jumlah_putaran, interval_detik)
+    )
+    DAFTAR_JOB[id_job] = {"task": tugas, "stop": False, "chat_id": chat_id}
+
+
+async def jalankan_promosi(id_job, chat_id, pesan_sumber, teks_biasa, jumlah_putaran=1, interval_detik=0):
     """
-    Worker promosi yang jalan di background.
-    Mendukung perulangan (repeat_count) dengan jeda interval (interval_secs).
+    Worker promosi di background.
+    Daftar grup di-ambil ulang tiap putaran, jadi grup baru yang kita masuki
+    di tengah jadwal ikut kena promosi tanpa perlu restart bot.
     """
-    job = JOBS[job_id]
-    total_sukses = 0
-    total_gagal = 0
-    total_dilewati = 0
+    job = DAFTAR_JOB[id_job]
+    akumulasi_sukses = 0
+    akumulasi_gagal = 0
+    akumulasi_dilewati = 0
+    putaran_terakhir = 0
 
     try:
-        for current_round in range(1, repeat_count + 1):
+        for putaran in range(1, jumlah_putaran + 1):
             if job["stop"]:
                 break
+            putaran_terakhir = putaran
 
-            # Ambil semua grup terbaru yang bukan blacklist
-            groups = []
-            async for dialog in client.iter_dialogs():
-                if dialog.is_group and not in_blacklist(dialog.id):
-                    groups.append(dialog)
+            daftar_grup = []
+            async for dialog in klien.iter_dialogs():
+                if dialog.is_group and not sedang_diblacklist(dialog.id):
+                    daftar_grup.append(dialog)
 
-            total_groups = len(groups)
-            if total_groups == 0:
-                await client.send_message(
+            jumlah_grup = len(daftar_grup)
+            if jumlah_grup == 0:
+                await kirim_panel(
+                    klien,
                     chat_id,
-                    bq(f"⚠️ <b>Promosi #{job_id}</b>: Tidak ada grup yang ditemukan / semua di-blacklist."),
-                    parse_mode="html",
+                    f"⚠️ PROMOSI #{id_job} BERHENTI",
+                    ["Tidak ada grup yang bisa dikirimi.", "Semua grup masuk daftar hitam?"],
                 )
                 return
 
-            if repeat_count > 1:
-                await client.send_message(
+            if jumlah_putaran > 1:
+                await kirim_panel(
+                    klien,
                     chat_id,
-                    bq(f"🚀 <b>Promosi #{job_id} — Putaran {current_round}/{repeat_count}</b>\n"
-                       f"Mengirim ke {total_groups} grup (jeda {config['delay_min']}–{config['delay_max']} dtk/grup)..."),
-                    parse_mode="html",
+                    f"🚀 PROMOSI #{id_job} — PUTARAN {putaran}/{jumlah_putaran}",
+                    [("Target", f"{jumlah_grup} grup")],
+                    catatan="Sedang mengirim...",
                 )
 
             sukses, gagal, dilewati = 0, 0, 0
-            for idx, dialog in enumerate(groups, 1):
+            for nomor, dialog in enumerate(daftar_grup, 1):
                 if job["stop"]:
                     break
                 try:
-                    await send_promo_to(client, dialog.id, reply_msg, plain_text)
+                    await kirim_promosi_ke(klien, dialog.id, pesan_sumber, teks_biasa)
                     sukses += 1
                 except FloodWaitError as e:
-                    wait = min(e.seconds + 2, 300)
-                    await asyncio.sleep(wait)
+                    # Telegram minta kita sabar. Dibatasi 300 detik biar job gak ngegantung kelamaan.
+                    await asyncio.sleep(min(e.seconds + 2, 300))
                     try:
-                        await send_promo_to(client, dialog.id, reply_msg, plain_text)
+                        await kirim_promosi_ke(klien, dialog.id, pesan_sumber, teks_biasa)
                         sukses += 1
                     except Exception:
                         gagal += 1
                 except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError):
+                    # Bukan error kita: memang gak boleh nulis di situ. Lewati tanpa drama.
                     dilewati += 1
                 except Exception:
                     gagal += 1
 
-                # Jeda acak antar grup
-                if idx < total_groups and not job["stop"]:
-                    await asyncio.sleep(random.uniform(config["delay_min"], config["delay_max"]))
+                if nomor < jumlah_grup and not job["stop"]:
+                    await asyncio.sleep(random.uniform(konfig["delay_min"], konfig["delay_max"]))
 
-            total_sukses += sukses
-            total_gagal += gagal
-            total_dilewati += dilewati
+            akumulasi_sukses += sukses
+            akumulasi_gagal += gagal
+            akumulasi_dilewati += dilewati
 
-            # Notifikasi hasil per putaran
-            status_round = (
-                f"📊 <b>Promosi #{job_id} — Putaran {current_round}/{repeat_count}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"✅ Berhasil : {sukses}\n"
-                f"❌ Gagal    : {gagal}\n"
-                f"⏩ Dilewati : {dilewati}\n"
-                f"👥 Total    : {total_groups} grup"
+            await kirim_panel(
+                klien,
+                chat_id,
+                f"📊 PROMOSI #{id_job} — PUTARAN {putaran}/{jumlah_putaran}",
+                [
+                    ("✅ Berhasil", sukses),
+                    ("❌ Gagal", gagal),
+                    ("⏩ Dilewati", dilewati),
+                    ("👥 Total grup", jumlah_grup),
+                ],
             )
-            await client.send_message(chat_id, bq(status_round), parse_mode="html")
 
-            # Jika masih ada putaran berikutnya, tunggu selama interval_secs
-            if current_round < repeat_count and not job["stop"]:
-                await client.send_message(
+            if putaran < jumlah_putaran and not job["stop"]:
+                await kirim_panel(
+                    klien,
                     chat_id,
-                    bq(f"⏳ <b>Promosi #{job_id}</b>\n"
-                       f"Menunggu <b>{format_duration(interval_secs)}</b> sebelum putaran ke-{current_round + 1}...\n"
-                       f"<i>Ketik <code>.stop</code> untuk berhenti.</i>"),
-                    parse_mode="html",
+                    f"⏳ PROMOSI #{id_job} — JEDA",
+                    [
+                        ("Menunggu", format_durasi(interval_detik)),
+                        ("Putaran berikutnya", f"{putaran + 1}/{jumlah_putaran}"),
+                    ],
+                    catatan="Ketik .stop untuk berhenti.",
                 )
 
-                # Tidur bertahap agar bisa dihentikan kapan saja via .stop
-                for _ in range(interval_secs):
+                # Tidur dicicil per detik supaya .stop terasa responsif.
+                for _ in range(interval_detik):
                     if job["stop"]:
                         break
                     await asyncio.sleep(1)
 
-        # Laporan Akhir Keseluruhan
-        status_final = "🛑 <b>Promosi Dihentikan</b>" if job["stop"] else "🎉 <b>Semua Putaran Promosi Selesai!</b>"
-        hasil_total = (
-            f"{status_final} — Job #{job_id}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🔁 Total Putaran : {current_round}/{repeat_count}\n"
-            f"✅ Total Sukses  : {total_sukses}\n"
-            f"❌ Total Gagal   : {total_gagal}\n"
-            f"⏩ Total Dilewati: {total_dilewati}"
+        judul_akhir = (
+            f"🛑 PROMOSI #{id_job} DIHENTIKAN" if job["stop"]
+            else f"🎉 PROMOSI #{id_job} SELESAI"
         )
-        await client.send_message(chat_id, bq(hasil_total), parse_mode="html")
+        await kirim_panel(
+            klien,
+            chat_id,
+            judul_akhir,
+            [
+                ("🔁 Putaran", f"{putaran_terakhir}/{jumlah_putaran}"),
+                ("✅ Total berhasil", akumulasi_sukses),
+                ("❌ Total gagal", akumulasi_gagal),
+                ("⏩ Total dilewati", akumulasi_dilewati),
+            ],
+        )
 
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        await client.send_message(
-            chat_id, bq(f"❌ <b>Promosi #{job_id} Error:</b> {e}"), parse_mode="html"
-        )
+        await kirim_panel(klien, chat_id, f"❌ PROMOSI #{id_job} ERROR", [str(e)])
     finally:
-        JOBS.pop(job_id, None)
+        DAFTAR_JOB.pop(id_job, None)
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Titik masuk
 # ---------------------------------------------------------------------------
-async def main():
-    register_handlers()
+async def utama():
+    daftarkan_perintah()
     print("Menghubungkan ke Telegram...")
-    await client.connect()
+    await klien.connect()
 
-    if not await client.is_user_authorized():
-        phone = input("Masukkan nomor telepon (mis. +628123456789): ").strip()
-        await client.send_code_request(phone)
+    if not await klien.is_user_authorized():
+        nomor = input("Masukkan nomor telepon (mis. +628123456789): ").strip()
+        await klien.send_code_request(nomor)
         try:
-            code = input("Masukkan kode OTP: ").strip()
-            await client.sign_in(phone=phone, code=code)
+            kode = input("Masukkan kode OTP: ").strip()
+            await klien.sign_in(phone=nomor, code=kode)
         except SessionPasswordNeededError:
-            pw = input("Akun pakai 2FA. Masukkan password: ").strip()
-            await client.sign_in(password=pw)
+            sandi = input("Akun pakai 2FA. Masukkan password: ").strip()
+            await klien.sign_in(password=sandi)
 
-    me = await client.get_me()
-    nama = me.first_name or ""
-    uname = f" (@{me.username})" if me.username else ""
-    print(f"\n✅ Login sukses sebagai: {nama}{uname}")
+    saya = await klien.get_me()
+    nama = saya.first_name or ""
+    username = f" (@{saya.username})" if saya.username else ""
+    print(f"\n✅ Login sukses sebagai: {nama}{username}")
     print("Userbot berjalan. Ketik .help di Telegram. Tekan Ctrl+C untuk berhenti.\n")
 
-    await client.run_until_disconnected()
+    await klien.run_until_disconnected()
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(utama())
     except KeyboardInterrupt:
         print("\nUserbot dihentikan.")
